@@ -1,17 +1,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/infobloxopen/db-controller/dbproxy/pgbouncer"
+
+	"github.com/infobloxopen/hotload/fsnotify"
 )
 
-func generatePGBouncerConfiguration(dbCredentialPath, dbPasswordPath string, port int, pbCredentialPath string) {
-	dbc, err := pgbouncer.ParseDBCredentials(dbCredentialPath, dbPasswordPath)
+func generatePGBouncerConfiguration(dsn string, port int, pbCredentialPath string) {
+	dbc, err := pgbouncer.ParseDBCredentials(dsn)
 	if err != nil {
 		log.Println(err)
 		panic(err)
@@ -19,8 +21,8 @@ func generatePGBouncerConfiguration(dbCredentialPath, dbPasswordPath string, por
 	localHost := "127.0.0.1"
 	localPort := port
 	err = pgbouncer.WritePGBouncerConfig(pbCredentialPath, &pgbouncer.PGBouncerConfig{
-		LocalDbName: dbc.DBName, LocalHost: &localHost, LocalPort: int16(localPort),
-		RemoteHost: dbc.Host, RemotePort: int16(dbc.Port), UserName: dbc.User, Password: dbc.Password})
+		LocalDbName: dbc.GetDBName(), LocalHost: localHost, LocalPort: int16(localPort),
+		RemoteHost: dbc.GetHost(), RemotePort: int16(dbc.GetPort()), UserName: dbc.GetUser(), Password: dbc.GetPassword()})
 	if err != nil {
 		log.Println(err)
 		panic(err)
@@ -91,55 +93,28 @@ func main() {
 	}
 
 	waitForDbCredentialFile(dbCredentialPath)
-
-	waitForDbCredentialFile(dbPasswordPath)
-
-	// First time pgbouncer config generation and start
-	generatePGBouncerConfiguration(dbCredentialPath, dbPasswordPath, port, pbCredentialPath)
-	startPGBouncer()
-
-	// Watch for ongoing changes and regenerate pgbouncer config
-	watcher, err := fsnotify.NewWatcher()
+	s := fsnotify.NewStrategy()
+	dsn, dsns, err := s.Watch(context.Background(), dbCredentialPath, nil)
 	if err != nil {
 		log.Fatal("NewWatcher failed: ", err)
 	}
-	defer watcher.Close()
 
-	done := make(chan bool)
+	// First time pgbouncer config generation and start
+	generatePGBouncerConfiguration(dsn, port, pbCredentialPath)
+	startPGBouncer()
+
+	// Watch for ongoing changes and regenerate pgbouncer config
+
 	go func() {
-		defer close(done)
 
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				log.Printf("%s %s\n", event.Name, event.Op)
-				err := watcher.Remove(dbCredentialPath)
-				if err != nil {
-					log.Fatal("Remove failed:", err)
-				}
-				err = watcher.Add(dbCredentialPath)
-				if err != nil {
-					log.Fatal("Add failed:", err)
-				}
-				// Regenerate pgbouncer configuration and signal pgbouncer to reload cconfiguration
-				generatePGBouncerConfiguration(dbCredentialPath, dbPasswordPath, port, pbCredentialPath)
-				reloadPGBouncerConfiguration()
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Println("error:", err)
+		for dsn := range dsns {
+			if dsn == "" {
+				log.Fatalf("could not get any more dsns, range closed")
 			}
+			// Regenerate pgbouncer configuration and signal pgbouncer to reload cconfiguration
+			generatePGBouncerConfiguration(dsn, port, pbCredentialPath)
+			reloadPGBouncerConfiguration()
 		}
 
 	}()
-
-	err = watcher.Add(dbCredentialPath)
-	if err != nil {
-		log.Fatal("Add failed:", err)
-	}
-	<-done
 }
